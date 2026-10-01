@@ -256,10 +256,12 @@ export async function createExpressApp() {
       }
     }
 
-    if (xMatchedPath && xMatchedPath.startsWith('/api')) {
-      req.url = xMatchedPath;
-    } else if (originalUrl && originalUrl.startsWith('/api')) {
+    const looksGenericApi = (val: string) => !val || val === '/api' || val === '/api/' || val.includes('[...path]');
+
+    if (originalUrl && originalUrl.startsWith('/api') && !looksGenericApi(originalUrl)) {
       req.url = originalUrl;
+    } else if (xMatchedPath && xMatchedPath.startsWith('/api') && !looksGenericApi(xMatchedPath)) {
+      req.url = xMatchedPath;
     } else if (query0) {
       const clean = Array.isArray(query0) ? query0.join('/') : String(query0);
       req.url = `/api/${clean.replace(/^\//, '')}`;

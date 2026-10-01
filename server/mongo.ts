@@ -208,16 +208,20 @@ export async function connectMongo(customUri?: string): Promise<{ success: boole
     console.log(`[MongoDB] Attempting to connect to MongoDB Atlas... (${maskMongoUri(uriToUse)})`);
 
     // Determine target database name (extract from URI path if present, otherwise default to deshi_bite)
-    let targetDbName = DB_NAME;
+    let targetDbName = DB_NAME || process.env.MONGODB_DB_NAME || 'deshi_bite';
     try {
       const pseudoUrl = uriToUse.replace('mongodb+srv://', 'http://').replace('mongodb://', 'http://');
       const parsed = new URL(pseudoUrl);
       const extractedDb = parsed.pathname.replace(/^\//, '').split('?')[0].trim();
-      if (extractedDb) {
+      if (extractedDb && extractedDb !== '/' && extractedDb !== 'hi_bite') {
         targetDbName = extractedDb;
       }
     } catch {
       // ignore
+    }
+
+    if (!targetDbName || targetDbName === '/' || targetDbName === 'hi_bite') {
+      targetDbName = process.env.MONGODB_DB_NAME || 'deshi_bite';
     }
     
     // Connect with optimized options for cloud environments and serverless (Vercel, container)
