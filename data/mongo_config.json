@@ -1,1 +1,5 @@
-{"uri":"mongodb+srv://ziniarrahmanmimi_db_user:0IOv6h7DlLE59Pmk@cluster0.bm7nuid.mongodb.net/deshi_bite?retryWrites=true&w=majority&appName=Cluster0","dbName":"deshi_bite","updatedAt":"2026-10-01T13:10:18.512Z"}
+{
+  "uri": "mongodb+srv://ziniarrahmanmimi_db_user:0IOv6h7DlLE59Pmk@cluster0.bm7nuid.mongodb.net/deshi_bite?retryWrites=true&w=majority&appName=Cluster0",
+  "dbName": "deshi_bite",
+  "updatedAt": "2026-10-01T14:05:00.000Z"
+}

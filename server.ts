@@ -167,6 +167,7 @@ function loadDatabase(): DatabaseSchema {
   return loaded;
 }
 
+let pushMongoTimer: any = null;
 function saveDatabase(newDb: DatabaseSchema) {
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(newDb, null, 2), 'utf-8');
@@ -174,10 +175,13 @@ function saveDatabase(newDb: DatabaseSchema) {
     console.error('Failed to write db file:', err);
   }
 
-  // Asynchronously synchronize all records to MongoDB Cloud Atlas
-  syncToMongo(async () => {
-    await pushAllToMongo(newDb);
-  });
+  // Debounced asynchronous synchronization to MongoDB Cloud Atlas
+  if (pushMongoTimer) clearTimeout(pushMongoTimer);
+  pushMongoTimer = setTimeout(() => {
+    syncToMongo(async () => {
+      await pushAllToMongo(newDb);
+    });
+  }, 1500);
 }
 
 let db = loadDatabase();
@@ -290,52 +294,38 @@ export async function createExpressApp() {
     return true;
   }
 
-  if (!IS_SERVERLESS) {
-    // Long-running server (local / AI Studio): sync once at startup, in the background
-    syncFromMongo().then(() => saveDatabase(db)).catch((err: any) => {
-      console.warn('[MongoDB] Startup connection notice:', err?.message || err);
+  let lastMongoSyncTime = 0;
+  const MONGO_CACHE_TTL = 30000; // 30 seconds
+
+  // Non-blocking sync that keeps db fresh without locking requests
+  async function ensureMongoFresh(force = false): Promise<boolean> {
+    const now = Date.now();
+    if (!force && isMongoActive() && now - lastMongoSyncTime < MONGO_CACHE_TTL) {
+      return true;
+    }
+    const success = await syncFromMongo().catch((err: any) => {
+      console.warn('[MongoDB] Sync notice:', err?.message || err);
+      return false;
     });
-  } else {
-    // Serverless (Vercel): every instance is short-lived and instances do not share memory,
-    // so MongoDB must be the source of truth. Handle one request at a time per instance,
-    // load fresh data BEFORE the route runs, and save BEFORE the response is sent.
-    let queue: Promise<void> = Promise.resolve();
+    if (success) {
+      lastMongoSyncTime = Date.now();
+    }
+    return success;
+  }
+
+  // Initial non-blocking sync on boot
+  ensureMongoFresh(true).catch(() => {});
+
+  if (IS_SERVERLESS) {
     app.use((req, res, next) => {
       const p = req.path.replace(/^\/api/, '');
       if (p === '/health' || p.startsWith('/mongodb/')) return next();
 
-      const turn = queue;
-      let release!: () => void;
-      queue = new Promise<void>((r) => (release = r));
-      res.on('close', release);
-
-      turn
-        .then(async () => {
-          const active = await syncFromMongo().catch((e) => {
-            console.warn('[MongoDB] sync error:', e?.message || e);
-            return false;
-          });
-
-          if (!active && req.method !== 'GET' && p !== '/auth/login') {
-            return res.status(503).json({
-              error: 'Database not connected. Add MONGODB_URI in Vercel > Settings > Environment Variables, allow 0.0.0.0/0 in MongoDB Atlas Network Access, then redeploy.',
-              success: false,
-            });
-          }
-
-          if (active && req.method !== 'GET') {
-            // persist everything to MongoDB before the response goes out
-            const origEnd = res.end.bind(res) as any;
-            (res as any).end = (...args: any[]) => {
-              pushAllToMongo(db)
-                .catch((e) => console.warn('[MongoDB] save error:', e?.message || e))
-                .finally(() => origEnd(...args));
-              return res;
-            };
-          }
-          next();
-        })
-        .catch(next);
+      // Trigger background sync if cache expired, but do NOT block fast routes like login
+      if (Date.now() - lastMongoSyncTime > MONGO_CACHE_TTL) {
+        ensureMongoFresh().catch(() => {});
+      }
+      next();
     });
   }
 
@@ -968,10 +958,26 @@ export async function createExpressApp() {
       }
     }
 
+    const incomingId = req.body.id ? String(req.body.id).trim() : '';
+    const incomingInvoice = req.body.invoiceNo ? String(req.body.invoiceNo).trim() : '';
+
+    // Idempotency check: if sale already exists in db, return it immediately without duplicating
+    if (incomingId || incomingInvoice) {
+      const existing = db.sales.find((s) => (incomingId && s.id === incomingId) || (incomingInvoice && s.invoiceNo === incomingInvoice));
+      if (existing) {
+        return res.json({
+          success: true,
+          sale: existing,
+          agentUpdatedDue: agent.currentDue,
+          invoiceNo: existing.invoiceNo,
+        });
+      }
+    }
+
     const dt = getBangladeshDateTime();
     const invoiceCounter = db.sales.length + 1;
-    const invoiceNumber = `DB-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(invoiceCounter).padStart(5, '0')}`;
-    const saleId = `SALE-${Date.now()}-${invoiceCounter}`;
+    const invoiceNumber = incomingInvoice || `DB-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(invoiceCounter).padStart(5, '0')}`;
+    const saleId = incomingId || `SALE-${Date.now()}-${invoiceCounter}`;
 
     let subtotal = 0;
     const frozenItems = items.map((it: any) => {
@@ -1078,6 +1084,16 @@ export async function createExpressApp() {
     });
 
     saveDatabase(db);
+    syncToMongo(async () => {
+      await Promise.all([
+        mongoUpsert('sales', newSale.id, newSale),
+        mongoUpsert('users', agent.id, agent),
+        ...frozenItems.map((it: any) => {
+          const prod = db.products.find((p) => p.id === it.productId);
+          return prod ? mongoUpsert('products', prod.id, prod) : Promise.resolve();
+        }),
+      ]);
+    });
 
     res.json({
       success: true,

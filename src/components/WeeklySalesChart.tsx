@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
+import { Sale } from '../types';
 import { BarChart3 } from 'lucide-react';
 import { getBangladeshWeekDays, getDhakaYMD } from '../utils/salesDateUtils';
 
@@ -18,7 +19,23 @@ export const WeeklySalesChart: React.FC = () => {
     return () => clearInterval(timer);
   }, []);
 
-  const relevantSales = isAdmin ? sales : sales.filter((s) => s.agentId === currentUser?.id);
+  const rawSales = isAdmin ? sales : sales.filter((s) => s.agentId === currentUser?.id);
+  const relevantSales = React.useMemo(() => {
+    const map = new Map<string, Sale>();
+    rawSales.forEach((s) => {
+      const key = s.invoiceNo || s.id;
+      if (key && !map.has(key)) {
+        const isDup = Array.from(map.values()).some(
+          (existing) =>
+            existing.agentId === s.agentId &&
+            existing.grandTotal === s.grandTotal &&
+            Math.abs((existing.timestamp || 0) - (s.timestamp || 0)) < 60000
+        );
+        if (!isDup) map.set(key, s);
+      }
+    });
+    return Array.from(map.values());
+  }, [rawSales]);
 
   // Compute week days based on selected week tab (0 for this week, -1 for last week)
   const weekOffset = activeWeekTab === 'THIS_WEEK' ? 0 : -1;

@@ -160,7 +160,22 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const saved = localStorage.getItem('deshi_bite_sales');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed)) {
+          const map = new Map<string, Sale>();
+          parsed.forEach((s: Sale) => {
+            const key = s.invoiceNo || s.id;
+            if (key && !map.has(key)) {
+              const isDup = Array.from(map.values()).some(
+                (existing) =>
+                  existing.agentId === s.agentId &&
+                  existing.grandTotal === s.grandTotal &&
+                  Math.abs((existing.timestamp || 0) - (s.timestamp || 0)) < 60000
+              );
+              if (!isDup) map.set(key, s);
+            }
+          });
+          return Array.from(map.values());
+        }
       }
     } catch {}
     return INITIAL_SALES;
@@ -361,14 +376,31 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           return merged;
         });
 
-        // 2. Sales merge
+        // 2. Sales merge with strict deduplication by invoiceNo and id
         setSales((prev) => {
           const map = new Map<string, Sale>();
-          (data.sales || []).forEach((s: Sale) => map.set(s.id, s));
-          prev.forEach((s) => {
-            if (!map.has(s.id)) map.set(s.id, s);
+          // Server data is source of truth
+          (data.sales || []).forEach((s: Sale) => {
+            const key = s.invoiceNo || s.id;
+            if (key) map.set(key, s);
           });
-          const merged = Array.from(map.values());
+          // Only keep local sales that have not reached server yet
+          prev.forEach((s) => {
+            const key = s.invoiceNo || s.id;
+            if (key && !map.has(key)) {
+              // Ensure it's not a duplicate with same agent, grandTotal, and close timestamp
+              const isDuplicate = Array.from(map.values()).some(
+                (existing) =>
+                  existing.agentId === s.agentId &&
+                  existing.grandTotal === s.grandTotal &&
+                  Math.abs((existing.timestamp || 0) - (s.timestamp || 0)) < 60000
+              );
+              if (!isDuplicate) {
+                map.set(key, s);
+              }
+            }
+          });
+          const merged = Array.from(map.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
           try {
             localStorage.setItem('deshi_bite_sales', JSON.stringify(merged));
           } catch {}
@@ -625,7 +657,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const discountAmount = Number(saleData.discount) || 0;
       const grandTotal = Math.max(0, subtotal - discountAmount);
 
-      const newSale: Sale = {
+      const localSale: Sale = {
         id: saleId,
         invoiceNo,
         agentId: targetAgent.id,
@@ -644,10 +676,39 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         timestamp,
       };
 
-      // 1. Deduct Stock in LocalState
+      // 1. Authoritative backend creation (passing exact id & invoiceNo so server and client match)
+      let finalSale = localSale;
+      try {
+        const res = await fetch('/api/sales', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: saleId,
+            invoiceNo,
+            agentId: targetAgent.id,
+            saleType: saleData.saleType,
+            items: frozenItems,
+            customerName: saleData.customerName,
+            customerPhone: saleData.customerPhone,
+            customerAddress: saleData.customerAddress,
+            discount: discountAmount,
+          }),
+        });
+
+        if (res.ok) {
+          const resData = await res.json();
+          if (resData.success && resData.sale) {
+            finalSale = resData.sale;
+          }
+        }
+      } catch (err) {
+        console.warn('Backend sync notice for sale (running offline fallback):', err);
+      }
+
+      // 2. Deduct Stock in LocalState
       setProducts((prev) => {
         const updated = prev.map((p) => {
-          const matchingItem = frozenItems.find((it) => it.productId === p.id);
+          const matchingItem = finalSale.items.find((it) => it.productId === p.id);
           if (!matchingItem) return p;
           if (matchingItem.unit === 'KG') {
             return { ...p, stockKg: Number(Math.max(0, (p.stockKg || 0) - matchingItem.quantity).toFixed(3)) };
@@ -661,15 +722,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return updated;
       });
 
-      // 2. Add Stock Transactions
-      const newStockTxs: StockTransaction[] = frozenItems.map((it) => ({
+      // 3. Add Stock Transactions
+      const newStockTxs: StockTransaction[] = finalSale.items.map((it) => ({
         id: `STX-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
         productId: it.productId,
         productName: it.productName,
         type: 'SALE_OUT',
         quantity: it.quantity,
         unit: it.unit,
-        referenceNote: `Deducted via Sale ${invoiceNo}`,
+        referenceNote: `Deducted via Sale ${finalSale.invoiceNo}`,
         recordedBy: currentUser.name,
         date: dateStr,
         time: timeStr,
@@ -686,16 +747,19 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return updated;
       });
 
-      // 3. Add to Sales
+      // 4. Add to Sales - Filter out any duplicates so record only exists 1 time
       setSales((prev) => {
-        const updated = [newSale, ...prev];
+        const filtered = prev.filter(
+          (s) => s.id !== finalSale.id && (!finalSale.invoiceNo || s.invoiceNo !== finalSale.invoiceNo)
+        );
+        const updated = [finalSale, ...filtered];
         try {
           localStorage.setItem('deshi_bite_sales', JSON.stringify(updated));
         } catch {}
         return updated;
       });
 
-      // 4. Update Agent Due if target is an Agent
+      // 5. Update Agent Due if target is an Agent
       if (targetAgent.role === 'AGENT') {
         setUsers((prev) => {
           const updated = prev.map((u) => {
@@ -719,29 +783,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
       }
 
-      showToast(`Sale confirmed! Invoice ${newSale.invoiceNo} generated`, 'success');
-
-      // 5. Asynchronously notify backend
-      try {
-        await fetch('/api/sales', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            agentId: targetAgent.id,
-            saleType: saleData.saleType,
-            items: frozenItems,
-            customerName: saleData.customerName,
-            customerPhone: saleData.customerPhone,
-            customerAddress: saleData.customerAddress,
-            discount: discountAmount,
-          }),
-        });
-      } catch (err) {
-        console.warn('Backend sync notice for sale:', err);
-      }
-
+      showToast(`Sale confirmed! Invoice ${finalSale.invoiceNo} generated`, 'success');
       setLoading(false);
-      return newSale;
+      return finalSale;
     } catch (err: any) {
       showToast(err?.message || 'Error recording sale', 'error');
       setLoading(false);

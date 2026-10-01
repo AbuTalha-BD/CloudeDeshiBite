@@ -149,7 +149,7 @@ let db: Db | null = null;
 let isConnected = false;
 let lastError: string | null = null;
 let activeUri: string = resolveConfiguredUri();
-let DB_NAME = process.env.MONGODB_DB_NAME || 'deshi_bite';
+let DB_NAME = (process.env.MONGODB_DB_NAME && process.env.MONGODB_DB_NAME !== 'hi_bite') ? process.env.MONGODB_DB_NAME : 'deshi_bite';
 
 export function maskMongoUri(uri: string): string {
   if (!uri) return '';
@@ -221,7 +221,9 @@ export async function connectMongo(customUri?: string): Promise<{ success: boole
     }
 
     if (!targetDbName || targetDbName === '/' || targetDbName === 'hi_bite') {
-      targetDbName = process.env.MONGODB_DB_NAME || 'deshi_bite';
+      targetDbName = (process.env.MONGODB_DB_NAME && process.env.MONGODB_DB_NAME !== 'hi_bite')
+        ? process.env.MONGODB_DB_NAME
+        : 'deshi_bite';
     }
     
     // Connect with optimized options for cloud environments and serverless (Vercel, container)

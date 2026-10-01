@@ -3,7 +3,7 @@ import { useApp } from '../context/AppContext';
 import { Banner } from '../components/Banner';
 import { StatCards } from '../components/StatCards';
 import { WeeklySalesChart } from '../components/WeeklySalesChart';
-import { getProductUnit, getProductStockValue, isProductLowStock } from '../types';
+import { getProductUnit, getProductStockValue, isProductLowStock, Sale } from '../types';
 import {
   Package,
   AlertTriangle,
@@ -34,8 +34,24 @@ export const DashboardView: React.FC = () => {
 
   const isAdmin = currentUser?.role === 'ADMIN';
 
-  // Relevant sales
-  const relevantSales = isAdmin ? sales : sales.filter((s) => s.agentId === currentUser?.id);
+  // Relevant sales with strict deduplication
+  const rawSales = isAdmin ? sales : sales.filter((s) => s.agentId === currentUser?.id);
+  const relevantSales = React.useMemo(() => {
+    const map = new Map<string, Sale>();
+    rawSales.forEach((s) => {
+      const key = s.invoiceNo || s.id;
+      if (key && !map.has(key)) {
+        const isDup = Array.from(map.values()).some(
+          (existing) =>
+            existing.agentId === s.agentId &&
+            existing.grandTotal === s.grandTotal &&
+            Math.abs((existing.timestamp || 0) - (s.timestamp || 0)) < 60000
+        );
+        if (!isDup) map.set(key, s);
+      }
+    });
+    return Array.from(map.values());
+  }, [rawSales]);
   const recentSales = [...relevantSales].slice(0, 5);
 
   // Pending agents for Admin

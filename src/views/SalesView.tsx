@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
-import { SaleType } from '../types';
+import { Sale, SaleType } from '../types';
 import { ShoppingCart, Search, FileText, ShoppingBag, Filter, Calendar } from 'lucide-react';
 
 export const SalesView: React.FC = () => {
@@ -17,8 +17,24 @@ export const SalesView: React.FC = () => {
   const [search, setSearch] = useState('');
   const [saleTypeFilter, setSaleTypeFilter] = useState<'ALL' | SaleType>('ALL');
 
-  // Filter sales
-  const relevantSales = isAdmin ? sales : sales.filter((s) => s.agentId === currentUser?.id);
+  // Filter sales with strict deduplication
+  const rawSales = isAdmin ? sales : sales.filter((s) => s.agentId === currentUser?.id);
+  const relevantSales = useMemo(() => {
+    const map = new Map<string, Sale>();
+    rawSales.forEach((s) => {
+      const key = s.invoiceNo || s.id;
+      if (key && !map.has(key)) {
+        const isDup = Array.from(map.values()).some(
+          (existing) =>
+            existing.agentId === s.agentId &&
+            existing.grandTotal === s.grandTotal &&
+            Math.abs((existing.timestamp || 0) - (s.timestamp || 0)) < 60000
+        );
+        if (!isDup) map.set(key, s);
+      }
+    });
+    return Array.from(map.values());
+  }, [rawSales]);
 
   const filteredSales = useMemo(() => {
     return relevantSales.filter((s) => {
