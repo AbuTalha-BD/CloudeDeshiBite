@@ -1,0 +1,1382 @@
+import express from 'express';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import {
+  INITIAL_PRODUCTS,
+  INITIAL_USERS,
+  INITIAL_SALES,
+  INITIAL_STOCK_TRANSACTIONS,
+  INITIAL_PAYMENTS,
+  INITIAL_NOTIFICATIONS,
+  INITIAL_LOGS,
+  INITIAL_SETTINGS,
+} from './src/data/seedData.js';
+import type { Product, User, Sale, StockTransaction, PaymentRecord, AppNotification, AdminLog, BusinessSettings } from './src/types.js';
+import {
+  connectMongo,
+  getMongoStatus,
+  pushAllToMongo,
+  pullAllFromMongo,
+  mongoUpsert,
+  mongoInsert,
+  getMongoUserByPhone,
+  isMongoActive,
+  getWritableDataDir,
+} from './server/mongo.js';
+
+const currentFileUrl = typeof import.meta !== 'undefined' && import.meta.url ? import.meta.url : '';
+const currentFilename = currentFileUrl ? fileURLToPath(currentFileUrl) : (typeof __filename !== 'undefined' ? __filename : '');
+const currentDirname = typeof __dirname !== 'undefined' ? __dirname : (currentFilename ? path.dirname(currentFilename) : process.cwd());
+
+const PORT = 3000;
+const DB_DIR = getWritableDataDir();
+const DB_FILE = path.join(DB_DIR, 'deshi_bite_db.json');
+
+// Helper to asynchronously sync mutations to MongoDB Cloud
+function syncToMongo(task: () => Promise<void>) {
+  if (isMongoActive()) {
+    task().catch((err) => console.warn('[MongoDB Sync Notice]:', err?.message || err));
+  }
+}
+
+interface DatabaseSchema {
+  products: Product[];
+  users: User[];
+  sales: Sale[];
+  stockTransactions: StockTransaction[];
+  payments: PaymentRecord[];
+  notifications: AppNotification[];
+  logs: AdminLog[];
+  settings: BusinessSettings;
+}
+
+// Ensure data directory exists
+if (!fs.existsSync(DB_DIR)) {
+  fs.mkdirSync(DB_DIR, { recursive: true });
+}
+
+// Load or initialize DB
+function loadDatabase(): DatabaseSchema {
+  let loaded: DatabaseSchema | null = null;
+  const candidateFiles = [
+    DB_FILE,
+    path.join(process.cwd(), 'data', 'deshi_bite_db.json'),
+    path.join(currentDirname, 'data', 'deshi_bite_db.json'),
+  ];
+
+  for (const cf of candidateFiles) {
+    if (fs.existsSync(cf)) {
+      try {
+        const content = fs.readFileSync(cf, 'utf-8');
+        const parsed = JSON.parse(content);
+        if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) {
+          loaded = parsed;
+          break;
+        }
+      } catch (e) {
+        console.error('Error reading db file candidate:', cf, e);
+      }
+    }
+  }
+
+  if (!loaded) {
+    const initialDb: DatabaseSchema = {
+      products: INITIAL_PRODUCTS,
+      users: INITIAL_USERS,
+      sales: INITIAL_SALES,
+      stockTransactions: INITIAL_STOCK_TRANSACTIONS,
+      payments: INITIAL_PAYMENTS,
+      notifications: INITIAL_NOTIFICATIONS,
+      logs: INITIAL_LOGS,
+      settings: INITIAL_SETTINGS,
+    };
+
+    saveDatabase(initialDb);
+    return initialDb;
+  }
+
+  // Purge any rejected agents and the other 2 agents (Rahim Ahmed, Karim Mollah)
+  if (loaded.users) {
+    loaded.users = loaded.users.filter(
+      (u) => u.status !== 'REJECTED' && u.name !== 'Rahim Ahmed' && u.name !== 'Karim Mollah'
+    );
+    // Ensure Toha Jamil has zero sales and zero due
+    loaded.users.forEach((u) => {
+      if (u.name === 'Toha Jamil') {
+        u.totalSales = 0;
+        u.totalPaid = 0;
+        u.currentDue = 0;
+        u.status = 'ACTIVE';
+      }
+    });
+  }
+
+  // Clear sales and payments so total sell is zero and total due is zero
+  loaded.sales = [];
+  loaded.payments = [];
+
+  // Clean stock transactions from sales and clear pre-existing seed stock in records
+  if (loaded.stockTransactions) {
+    loaded.stockTransactions = loaded.stockTransactions.filter(
+      (tx) => tx.type !== 'SALE' && tx.type !== 'SALE_OUT' && !tx.id.startsWith('STX-20260914') && !tx.id.startsWith('STX-20260915')
+    );
+  }
+
+  // Clean any pending registration notifications
+  if (loaded.notifications) {
+    loaded.notifications = loaded.notifications.filter(
+      (n) => !n.title.includes('Registration Pending')
+    );
+  }
+
+  // Ensure default low stock alert for KG is 0.5 instead of 5
+  if (loaded.products) {
+    loaded.products.forEach((p) => {
+      if (p.lowStockThresholdKg === 5) {
+        p.lowStockThresholdKg = 0.5;
+      }
+    });
+  }
+
+  if (loaded.settings && (loaded.settings.lowStockDefaultKg === 5 || !loaded.settings.lowStockDefaultKg)) {
+    loaded.settings.lowStockDefaultKg = 0.5;
+  }
+
+  // Ensure payment dates are populated
+  if (loaded.payments) {
+    loaded.payments.forEach((p) => {
+      if (!p.createdAtDate && p.date) p.createdAtDate = p.date;
+      if (!p.createdAtTime && p.time) p.createdAtTime = p.time;
+      if (!p.date && p.createdAtDate) p.date = p.createdAtDate;
+      if (!p.time && p.createdAtTime) p.time = p.createdAtTime;
+    });
+  }
+
+  // Ensure stock transaction dates are populated
+  if (loaded.stockTransactions) {
+    loaded.stockTransactions.forEach((tx) => {
+      if (!tx.createdAtDate && tx.date) tx.createdAtDate = tx.date;
+      if (!tx.createdAtTime && tx.time) tx.createdAtTime = tx.time;
+      if (!tx.date && tx.createdAtDate) tx.date = tx.createdAtDate;
+      if (!tx.time && tx.createdAtTime) tx.time = tx.createdAtTime;
+    });
+  }
+
+  saveDatabase(loaded);
+  return loaded;
+}
+
+function saveDatabase(newDb: DatabaseSchema) {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(newDb, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Failed to write db file:', err);
+  }
+
+  // Asynchronously synchronize all records to MongoDB Cloud Atlas
+  syncToMongo(async () => {
+    await pushAllToMongo(newDb);
+  });
+}
+
+let db = loadDatabase();
+
+// Bangladesh Time helper
+function getBangladeshDateTime() {
+  const now = new Date();
+  const dateStr = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Dhaka',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  }).format(now);
+
+  const timeStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Dhaka',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true,
+  }).format(now);
+
+  return { date: dateStr, time: timeStr, timestamp: now.getTime() };
+}
+
+export async function createExpressApp() {
+  const app = express();
+
+  // Support both pre-parsed bodies (Vercel serverless environment) and raw stream bodies (local Vite/Node)
+  app.use((req, res, next) => {
+    // If body is already parsed by Vercel or upstream serverless helper
+    if (req.body && typeof req.body === 'object') {
+      return next();
+    }
+    if (typeof req.body === 'string') {
+      try {
+        req.body = JSON.parse(req.body);
+        return next();
+      } catch {
+        // ignore
+      }
+    }
+    // If request stream was already consumed or ended, don't let body-parser crash with "stream is not readable"
+    if ((req as any)._readableState?.ended || req.readableEnded) {
+      req.body = req.body || {};
+      return next();
+    }
+    express.json()(req, res, (err) => {
+      if (err) {
+        // Fallback to empty body rather than crashing request
+        req.body = req.body || {};
+      }
+      next();
+    });
+  });
+
+  // CORS and Vercel route normalization middleware
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+
+    // Restore URL path if rewritten by Vercel serverless function (e.g. /api/(.*) -> /api)
+    const xMatchedPath = (req.headers['x-matched-path'] as string) || '';
+    const originalUrl = (req.headers['x-original-url'] as string) || (req.headers['x-forwarded-uri'] as string) || '';
+    let query0 = (req as any).query?.['0'] || (req as any).query?.path;
+
+    if (!query0 && req.url) {
+      try {
+        const u = new URL(req.url, 'http://localhost');
+        query0 = u.searchParams.get('0');
+      } catch {
+        // ignore
+      }
+    }
+
+    if (xMatchedPath && xMatchedPath.startsWith('/api')) {
+      req.url = xMatchedPath;
+    } else if (originalUrl && originalUrl.startsWith('/api')) {
+      req.url = originalUrl;
+    } else if (query0) {
+      const clean = Array.isArray(query0) ? query0.join('/') : String(query0);
+      req.url = `/api/${clean.replace(/^\//, '')}`;
+    }
+
+    next();
+  });
+
+  const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.NOW_REGION);
+
+  // Make sure this instance has connected to MongoDB and holds the latest data.
+  // Returns true when MongoDB is the active source of truth.
+  async function syncFromMongo(): Promise<boolean> {
+    const mongoRes = await connectMongo();
+    if (!mongoRes.success) {
+      console.log(`[MongoDB] Status: ${mongoRes.message}`);
+      return false;
+    }
+    const remoteData = await pullAllFromMongo();
+    if (remoteData && remoteData.products.length > 0) {
+      db = remoteData;
+    } else {
+      await pushAllToMongo(db);
+      console.log('[MongoDB] Pushed initial dataset to MongoDB Atlas Cloud');
+    }
+    return true;
+  }
+
+  if (!IS_SERVERLESS) {
+    // Long-running server (local / AI Studio): sync once at startup, in the background
+    syncFromMongo().then(() => saveDatabase(db)).catch((err: any) => {
+      console.warn('[MongoDB] Startup connection notice:', err?.message || err);
+    });
+  } else {
+    // Serverless (Vercel): every instance is short-lived and instances do not share memory,
+    // so MongoDB must be the source of truth. Handle one request at a time per instance,
+    // load fresh data BEFORE the route runs, and save BEFORE the response is sent.
+    let queue: Promise<void> = Promise.resolve();
+    app.use((req, res, next) => {
+      const p = req.path.replace(/^\/api/, '');
+      if (p === '/health' || p.startsWith('/mongodb/')) return next();
+
+      const turn = queue;
+      let release!: () => void;
+      queue = new Promise<void>((r) => (release = r));
+      res.on('close', release);
+
+      turn
+        .then(async () => {
+          const active = await syncFromMongo().catch((e) => {
+            console.warn('[MongoDB] sync error:', e?.message || e);
+            return false;
+          });
+
+          if (!active && req.method !== 'GET' && p !== '/auth/login') {
+            return res.status(503).json({
+              error: 'Database not connected. Add MONGODB_URI in Vercel > Settings > Environment Variables, allow 0.0.0.0/0 in MongoDB Atlas Network Access, then redeploy.',
+              success: false,
+            });
+          }
+
+          if (active && req.method !== 'GET') {
+            // persist everything to MongoDB before the response goes out
+            const origEnd = res.end.bind(res) as any;
+            (res as any).end = (...args: any[]) => {
+              pushAllToMongo(db)
+                .catch((e) => console.warn('[MongoDB] save error:', e?.message || e))
+                .finally(() => origEnd(...args));
+              return res;
+            };
+          }
+          next();
+        })
+        .catch(next);
+    });
+  }
+
+  const apiRouter = express.Router();
+
+  // API ROUTES
+  // Health
+  apiRouter.get('/health', (req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'DESHI BITE Enterprise Server',
+      timezone: 'Asia/Dhaka',
+      time: getBangladeshDateTime(),
+      mongodbConnected: isMongoActive(),
+    });
+  });
+
+  // MongoDB Atlas: Status endpoint
+  apiRouter.get('/mongodb/status', async (req, res) => {
+    if (!isMongoActive()) {
+      await connectMongo().catch(() => undefined);
+    }
+    const status = await getMongoStatus();
+    res.json(status);
+  });
+
+  // MongoDB Atlas: Connect or update URI
+  apiRouter.post('/mongodb/connect', async (req, res) => {
+    const { uri } = req.body;
+    if (!uri?.trim()) {
+      return res.status(400).json({ success: false, message: 'MongoDB connection string (URI) is required' });
+    }
+    const result = await connectMongo(uri.trim());
+    if (result.success) {
+      const remoteData = await pullAllFromMongo();
+      if (remoteData && remoteData.products.length > 0) {
+        db = remoteData;
+        saveDatabase(db);
+      } else {
+        await pushAllToMongo(db);
+      }
+    }
+    const status = await getMongoStatus();
+    const note = result.success && IS_SERVERLESS
+      ? ' NOTE: on Vercel this only lasts for this instance. Add MONGODB_URI in Vercel > Settings > Environment Variables and redeploy to keep it permanently.'
+      : '';
+    res.json({ ...result, message: result.message + note, status });
+  });
+
+  // MongoDB Atlas: Sync data
+  apiRouter.post('/mongodb/sync', async (req, res) => {
+    const { direction } = req.body; // 'push' or 'pull'
+    if (!isMongoActive()) {
+      return res.status(400).json({
+        success: false,
+        error: 'MongoDB Atlas is not connected yet. Please configure your MongoDB URI first.',
+      });
+    }
+
+    if (direction === 'pull') {
+      const remoteData = await pullAllFromMongo();
+      if (remoteData) {
+        db = remoteData;
+        saveDatabase(db);
+        return res.json({ success: true, message: 'Live data successfully pulled from MongoDB Atlas Cloud!' });
+      } else {
+        return res.status(404).json({ success: false, error: 'No data documents found in MongoDB Cloud database.' });
+      }
+    }
+
+    const pushed = await pushAllToMongo(db);
+    if (pushed) {
+      res.json({ success: true, message: 'All local products, sales, dues & records uploaded to MongoDB Cloud!' });
+    } else {
+      res.status(500).json({ success: false, error: 'Failed to upload state to MongoDB Cloud' });
+    }
+  });
+
+  // Get full state (for fast client hydration)
+  apiRouter.get('/state', (req, res) => {
+    res.json({
+      products: db.products,
+      users: db.users.map((u) => {
+        const { passwordHash, ...safeUser } = u;
+        return safeUser;
+      }),
+      sales: db.sales,
+      stockTransactions: db.stockTransactions,
+      payments: db.payments,
+      notifications: db.notifications,
+      logs: db.logs,
+      settings: db.settings,
+    });
+  });
+
+  // Client state synchronization for serverless persistence
+  apiRouter.post('/sync/client-state', (req, res) => {
+    try {
+      const { products, sales, users, stockTransactions, payments, settings } = req.body || {};
+
+      if (Array.isArray(products) && products.length > 0) {
+        const prodMap = new Map<string, Product>();
+        db.products.forEach((p) => prodMap.set(p.id, p));
+        products.forEach((p: Product) => prodMap.set(p.id, p));
+        db.products = Array.from(prodMap.values());
+      }
+
+      if (Array.isArray(sales) && sales.length > 0) {
+        const salesMap = new Map<string, Sale>();
+        db.sales.forEach((s) => salesMap.set(s.id, s));
+        sales.forEach((s: Sale) => salesMap.set(s.id, s));
+        db.sales = Array.from(salesMap.values());
+      }
+
+      if (Array.isArray(users) && users.length > 0) {
+        const userMap = new Map<string, User>();
+        db.users.forEach((u) => userMap.set(u.id, u));
+        users.forEach((u: User) => {
+          const existing = userMap.get(u.id);
+          userMap.set(u.id, { ...existing, ...u });
+        });
+        db.users = Array.from(userMap.values());
+      }
+
+      if (Array.isArray(stockTransactions) && stockTransactions.length > 0) {
+        const txMap = new Map<string, StockTransaction>();
+        db.stockTransactions.forEach((t) => txMap.set(t.id, t));
+        stockTransactions.forEach((t: StockTransaction) => txMap.set(t.id, t));
+        db.stockTransactions = Array.from(txMap.values());
+      }
+
+      if (Array.isArray(payments) && payments.length > 0) {
+        const payMap = new Map<string, PaymentRecord>();
+        db.payments.forEach((p) => payMap.set(p.id, p));
+        payments.forEach((p: PaymentRecord) => payMap.set(p.id, p));
+        db.payments = Array.from(payMap.values());
+      }
+
+      if (settings && typeof settings === 'object') {
+        Object.assign(db.settings, settings);
+      }
+
+      saveDatabase(db);
+      res.json({ success: true, count: { products: db.products.length, sales: db.sales.length } });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Sync error' });
+    }
+  });
+
+  // Auth: Login
+  apiRouter.post('/auth/login', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const cleanPhone = body.phone ? String(body.phone).trim() : '';
+      const cleanPassword = body.password ? String(body.password).trim() : '';
+
+      if (!cleanPhone || !cleanPassword) {
+        return res.status(400).json({ error: 'Phone number and password are required' });
+      }
+
+      if (!db || !Array.isArray(db.users) || db.users.length === 0) {
+        db = loadDatabase();
+      }
+
+      let user = (db.users || []).find((u) => u.phone === cleanPhone);
+
+      // If not found in local memory, check MongoDB directly if active
+      if (!user && isMongoActive()) {
+        try {
+          const mongoUser = await getMongoUserByPhone(cleanPhone);
+          if (mongoUser) {
+            user = mongoUser;
+            if (!db.users.some((u) => u.id === user!.id)) {
+              db.users.push(user);
+            }
+          }
+        } catch (err) {
+          console.warn('[MongoDB] Auth lookup fallback notice:', err);
+        }
+      }
+
+      // If still not found, check INITIAL_USERS as ultimate fallback
+      if (!user) {
+        const seedUser = INITIAL_USERS.find((u) => u.phone === cleanPhone);
+        if (seedUser) {
+          user = seedUser;
+          if (!db.users.some((u) => u.id === user!.id)) {
+            db.users.push(user);
+          }
+        }
+      }
+
+      if (!user) {
+        return res.status(401).json({ error: 'Invalid phone number or password' });
+      }
+
+      if (user.passwordHash !== cleanPassword) {
+        return res.status(401).json({ error: 'Invalid phone number or password' });
+      }
+
+      if (user.status === 'PENDING') {
+        return res.status(403).json({
+          error: 'Your account registration is currently PENDING approval by an Administrator.',
+        });
+      }
+
+      if (user.status === 'REJECTED') {
+        return res.status(403).json({
+          error: 'Your account registration has been rejected. Please contact DESHI BITE management.',
+        });
+      }
+
+      if (user.status === 'SUSPENDED') {
+        return res.status(403).json({
+          error: 'Your account is suspended. Please contact management.',
+        });
+      }
+
+      const { passwordHash, ...safeUser } = user;
+      return res.json({ success: true, user: safeUser });
+    } catch (err: any) {
+      console.error('[Login Error]:', err);
+      return res.status(500).json({ error: err?.message || 'Server error during login authentication' });
+    }
+  });
+
+  // Auth: Register Agent
+  apiRouter.post('/auth/register', (req, res) => {
+    const { name, phone, password, address } = req.body;
+    if (!name || !phone || !password) {
+      return res.status(400).json({ error: 'Name, phone, and password are required' });
+    }
+
+    const cleanPhone = phone.trim();
+    if (db.users.some((u) => u.phone === cleanPhone)) {
+      return res.status(400).json({ error: 'An account with this phone number already exists' });
+    }
+
+    const dt = getBangladeshDateTime();
+    const newAgent: User = {
+      id: `AGENT-${String(db.users.filter((u) => u.role === 'AGENT').length + 1).padStart(4, '0')}`,
+      name: name.trim(),
+      phone: cleanPhone,
+      passwordHash: password.trim(),
+      role: 'AGENT',
+      status: 'PENDING',
+      totalSales: 0,
+      totalPaid: 0,
+      currentDue: 0,
+      address: address?.trim() || '',
+      joinedDate: dt.date,
+    };
+
+    db.users.push(newAgent);
+
+    // Add Admin Notification
+    const notif: AppNotification = {
+      id: `NOTIF-${Date.now()}`,
+      title: 'New Agent Registration Pending',
+      message: `${newAgent.name} (${newAgent.phone}) has applied for an agent account.`,
+      type: 'INFO',
+      isRead: false,
+      date: dt.date,
+      time: dt.time,
+      targetRole: 'ADMIN',
+      timestamp: dt.timestamp,
+    };
+    db.notifications.unshift(notif);
+
+    // Audit log
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: newAgent.name,
+      role: 'AGENT',
+      action: 'Agent Registered (Pending)',
+      referenceId: newAgent.id,
+      details: `New registration with phone ${newAgent.phone}`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+    res.json({
+      success: true,
+      message: 'Agent registration submitted successfully! Please wait for Admin approval.',
+      agentId: newAgent.id,
+    });
+  });
+
+  // Auth: Change password
+  apiRouter.post('/auth/change-password', (req, res) => {
+    const { userId, oldPassword, newPassword } = req.body;
+    const user = db.users.find((u) => u.id === userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (user.passwordHash !== oldPassword) {
+      return res.status(400).json({ error: 'Current password does not match' });
+    }
+
+    if (!newPassword || newPassword.trim().length < 4) {
+      return res.status(400).json({ error: 'New password must be at least 4 characters long' });
+    }
+
+    user.passwordHash = newPassword.trim();
+    saveDatabase(db);
+    syncToMongo(async () => {
+      await mongoUpsert('users', user.id, user);
+    });
+
+    const dt = getBangladeshDateTime();
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: user.name,
+      role: user.role,
+      action: 'Password Changed',
+      referenceId: user.id,
+      details: `${user.role} (${user.name}) updated account password securely`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+    saveDatabase(db);
+
+    res.json({ success: true, message: 'Password updated successfully!' });
+  });
+
+  // Users: Update Profile (Address & Email - Name and Phone are strictly immutable)
+  apiRouter.put('/users/:id/profile', (req, res) => {
+    const { id } = req.params;
+    const { address, email } = req.body;
+    const user = db.users.find((u) => u.id === id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Name and phone are strictly IMMUTABLE as requested
+    if (address !== undefined) {
+      user.address = String(address).trim();
+    }
+    if (email !== undefined) {
+      user.email = String(email).trim();
+    }
+
+    saveDatabase(db);
+    syncToMongo(async () => {
+      await mongoUpsert('users', user.id, user);
+    });
+
+    const dt = getBangladeshDateTime();
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: user.name,
+      role: user.role,
+      action: 'Profile Updated',
+      referenceId: user.id,
+      details: `${user.name} updated profile details (address / email)`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+    saveDatabase(db);
+
+    const { passwordHash, ...safeUser } = user;
+    res.json({
+      success: true,
+      message: 'Profile details updated successfully!',
+      user: safeUser,
+    });
+  });
+
+  // Agents: Update status (Approve, Reject, Suspend, Activate)
+  apiRouter.put('/agents/:id/status', (req, res) => {
+    const { id } = req.params;
+    const { status, adminName } = req.body;
+    const agentIndex = db.users.findIndex((u) => u.id === id);
+
+    if (agentIndex === -1) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    const agent = db.users[agentIndex];
+    const dt = getBangladeshDateTime();
+
+    if (status === 'REJECTED') {
+      // User directive: Rejecting an agent must completely remove them from the admin panel
+      db.users.splice(agentIndex, 1);
+      db.logs.unshift({
+        id: `LOG-${Date.now()}`,
+        user: adminName || 'Admin Manager',
+        role: 'ADMIN',
+        action: 'Agent Application Rejected',
+        referenceId: id,
+        details: `${agent.name} (${agent.phone}) registration was rejected and removed from system`,
+        date: dt.date,
+        time: dt.time,
+        timestamp: dt.timestamp,
+      });
+      saveDatabase(db);
+      return res.json({ success: true, message: 'Agent registration rejected and removed from admin portal', removedId: id });
+    }
+
+    agent.status = status;
+
+    // Log
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: adminName || 'Admin Manager',
+      role: 'ADMIN',
+      action: `Agent Status Updated to ${status}`,
+      referenceId: agent.id,
+      details: `${agent.name} status updated to ${status}`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+    res.json({ success: true, agent });
+  });
+
+  // Agents: Delete / Remove
+  apiRouter.delete('/agents/:id', (req, res) => {
+    const { id } = req.params;
+    const index = db.users.findIndex((u) => u.id === id);
+    if (index === -1) return res.status(404).json({ error: 'Agent not found' });
+
+    const agent = db.users[index];
+    db.users.splice(index, 1);
+
+    const dt = getBangladeshDateTime();
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: 'Admin Manager',
+      role: 'ADMIN',
+      action: 'Agent Removed',
+      referenceId: id,
+      details: `Removed agent "${agent.name}" (${id})`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+    res.json({ success: true, message: `Agent "${agent.name}" removed successfully`, removedId: id });
+  });
+
+  // Products: Add
+  apiRouter.post('/products', (req, res) => {
+    const {
+      name,
+      retailPriceKg,
+      retailPricePcs,
+      wholesalePriceKg,
+      wholesalePricePcs,
+      stockKg,
+      stockPcs,
+      lowStockThresholdKg,
+      lowStockThresholdPcs,
+      active,
+    } = req.body;
+
+    if (!name?.trim()) {
+      return res.status(400).json({ error: 'Product name is required' });
+    }
+
+    const dt = getBangladeshDateTime();
+    const newProd: Product = {
+      id: `PROD-${1000 + db.products.length + 1}`,
+      name: name.trim(),
+      retailPriceKg: retailPriceKg ? Number(retailPriceKg) : null,
+      retailPricePcs: retailPricePcs ? Number(retailPricePcs) : null,
+      wholesalePriceKg: wholesalePriceKg ? Number(wholesalePriceKg) : null,
+      wholesalePricePcs: wholesalePricePcs ? Number(wholesalePricePcs) : null,
+      stockKg: Number(stockKg) || 0,
+      stockPcs: Number(stockPcs) || 0,
+      lowStockThresholdKg: lowStockThresholdKg !== undefined && lowStockThresholdKg !== '' ? Number(lowStockThresholdKg) : 0.5,
+      lowStockThresholdPcs: Number(lowStockThresholdPcs) || 20,
+      active: active !== undefined ? active : true,
+      updatedAt: dt.date,
+    };
+
+    db.products.push(newProd);
+
+    // Initial stock transaction if stock > 0
+    if (newProd.stockKg > 0 || newProd.stockPcs > 0) {
+      db.stockTransactions.unshift({
+        id: `STX-${Date.now()}`,
+        productId: newProd.id,
+        productName: newProd.name,
+        type: 'INITIAL',
+        quantity: newProd.stockKg || newProd.stockPcs,
+        unit: newProd.stockKg ? 'KG' : 'PCS',
+        referenceNote: 'Initial stock on product creation',
+        recordedBy: 'Admin Manager',
+        date: dt.date,
+        time: dt.time,
+        timestamp: dt.timestamp,
+      });
+    }
+
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: 'Admin Manager',
+      role: 'ADMIN',
+      action: 'Product Added',
+      referenceId: newProd.id,
+      details: `Created product "${newProd.name}"`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+    res.json({ success: true, product: newProd });
+  });
+
+  // Products: Edit
+  apiRouter.put('/products/:id', (req, res) => {
+    const { id } = req.params;
+    const prod = db.products.find((p) => p.id === id);
+    if (!prod) return res.status(404).json({ error: 'Product not found' });
+
+    const dt = getBangladeshDateTime();
+    Object.assign(prod, {
+      name: req.body.name?.trim() || prod.name,
+      retailPriceKg: req.body.retailPriceKg !== undefined ? (req.body.retailPriceKg ? Number(req.body.retailPriceKg) : null) : prod.retailPriceKg,
+      retailPricePcs: req.body.retailPricePcs !== undefined ? (req.body.retailPricePcs ? Number(req.body.retailPricePcs) : null) : prod.retailPricePcs,
+      wholesalePriceKg: req.body.wholesalePriceKg !== undefined ? (req.body.wholesalePriceKg ? Number(req.body.wholesalePriceKg) : null) : prod.wholesalePriceKg,
+      wholesalePricePcs: req.body.wholesalePricePcs !== undefined ? (req.body.wholesalePricePcs ? Number(req.body.wholesalePricePcs) : null) : prod.wholesalePricePcs,
+      stockKg: req.body.stockKg !== undefined ? Number(req.body.stockKg) : prod.stockKg,
+      stockPcs: req.body.stockPcs !== undefined ? Number(req.body.stockPcs) : prod.stockPcs,
+      lowStockThresholdKg: req.body.lowStockThresholdKg !== undefined && req.body.lowStockThresholdKg !== '' ? Number(req.body.lowStockThresholdKg) : prod.lowStockThresholdKg,
+      lowStockThresholdPcs: req.body.lowStockThresholdPcs !== undefined ? Number(req.body.lowStockThresholdPcs) : prod.lowStockThresholdPcs,
+      active: req.body.active !== undefined ? Boolean(req.body.active) : prod.active,
+      updatedAt: dt.date,
+    });
+
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: 'Admin Manager',
+      role: 'ADMIN',
+      action: 'Product Updated',
+      referenceId: prod.id,
+      details: `Updated details/pricing for "${prod.name}"`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+    res.json({ success: true, product: prod });
+  });
+
+  // Products: Delete
+  apiRouter.delete('/products/:id', (req, res) => {
+    const { id } = req.params;
+    const index = db.products.findIndex((p) => p.id === id);
+    if (index === -1) return res.status(404).json({ error: 'Product not found' });
+
+    const prod = db.products[index];
+    db.products.splice(index, 1);
+
+    const dt = getBangladeshDateTime();
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: 'Admin Manager',
+      role: 'ADMIN',
+      action: 'Product Deleted',
+      referenceId: id,
+      details: `Deleted product "${prod.name}" (${id})`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+    res.json({ success: true, message: `Product "${prod.name}" deleted successfully`, deletedId: id });
+  });
+
+  // Sales: Create Sale (Atomic Transaction)
+  apiRouter.post('/sales', (req, res) => {
+    const { agentId, saleType, items, customerName, customerPhone, customerAddress, discount } = req.body;
+    
+    // Find agent or admin
+    let agent = db.users.find((u) => u.id === agentId);
+    if (!agent) {
+      agent = INITIAL_USERS.find((u) => u.id === agentId);
+      if (agent && !db.users.some(u => u.id === agent!.id)) {
+        db.users.push(agent);
+      }
+    }
+    // Default fallback to Admin Manager or first user
+    if (!agent) {
+      agent = db.users.find((u) => u.role === 'ADMIN') || INITIAL_USERS[0];
+    }
+
+    if (!items || !items.length) {
+      return res.status(400).json({ error: 'At least one product item is required' });
+    }
+
+    // Ensure all products exist in db.products
+    for (const item of items) {
+      let prod = db.products.find((p) => p.id === item.productId);
+      if (!prod) {
+        const seedProd = INITIAL_PRODUCTS.find((p) => p.id === item.productId);
+        if (seedProd) {
+          prod = { ...seedProd };
+          db.products.push(prod);
+        } else {
+          prod = {
+            id: item.productId,
+            name: item.productName || 'Direct Item',
+            unit: item.unit || 'KG',
+            retailPriceKg: item.unit === 'KG' ? item.unitPrice : null,
+            retailPricePcs: item.unit === 'PCS' ? item.unitPrice : null,
+            wholesalePriceKg: item.unit === 'KG' ? item.unitPrice : null,
+            wholesalePricePcs: item.unit === 'PCS' ? item.unitPrice : null,
+            stockKg: 100,
+            stockPcs: 100,
+            lowStockThresholdKg: 0.5,
+            lowStockThresholdPcs: 20,
+            active: true,
+            updatedAt: getBangladeshDateTime().date,
+          };
+          db.products.push(prod);
+        }
+      }
+    }
+
+    const dt = getBangladeshDateTime();
+    const invoiceCounter = db.sales.length + 1;
+    const invoiceNumber = `DB-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(invoiceCounter).padStart(5, '0')}`;
+    const saleId = `SALE-${Date.now()}-${invoiceCounter}`;
+
+    let subtotal = 0;
+    const frozenItems = items.map((it: any) => {
+      const itemSubtotal = Number((it.quantity * it.unitPrice).toFixed(2));
+      subtotal += itemSubtotal;
+      return {
+        productId: it.productId,
+        productName: it.productName,
+        unit: it.unit,
+        quantity: it.quantity,
+        unitPrice: it.unitPrice,
+        subtotal: itemSubtotal,
+      };
+    });
+
+    const discountAmount = Number(discount) || 0;
+    const grandTotal = Math.max(0, subtotal - discountAmount);
+
+    // 1. Deduct Stock & Record Stock Transactions
+    for (const item of frozenItems) {
+      const prod = db.products.find((p) => p.id === item.productId)!;
+      const stockBefore = item.unit === 'KG' ? prod.stockKg : prod.stockPcs;
+      if (item.unit === 'KG') {
+        prod.stockKg = Number((prod.stockKg - item.quantity).toFixed(3));
+      } else {
+        prod.stockPcs = Math.max(0, prod.stockPcs - item.quantity);
+      }
+      const stockAfter = item.unit === 'KG' ? prod.stockKg : prod.stockPcs;
+
+      db.stockTransactions.unshift({
+        id: `STX-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        productId: prod.id,
+        productName: prod.name,
+        type: 'SALE_OUT',
+        quantity: item.quantity,
+        unit: item.unit,
+        referenceNote: `Deducted via Sale ${invoiceNumber}`,
+        recordedBy: agent.name,
+        date: dt.date,
+        time: dt.time,
+        createdAtDate: dt.date,
+        createdAtTime: dt.time,
+        timestamp: dt.timestamp,
+        stockBefore,
+        stockAfter,
+      });
+
+      // Check Low Stock Threshold
+      const isLowKg = prod.retailPriceKg || prod.wholesalePriceKg ? prod.stockKg <= prod.lowStockThresholdKg : false;
+      const isLowPcs = prod.retailPricePcs || prod.wholesalePricePcs ? prod.stockPcs <= prod.lowStockThresholdPcs : false;
+
+      if (isLowKg || isLowPcs) {
+        db.notifications.unshift({
+          id: `NOTIF-${Date.now()}-${prod.id}`,
+          title: 'Low Stock Alert',
+          message: `${prod.name} stock has fallen to ${prod.stockKg ? `${prod.stockKg} KG` : ''} ${prod.stockPcs ? `${prod.stockPcs} PCS` : ''} (below threshold).`,
+          type: 'ALERT',
+          isRead: false,
+          date: dt.date,
+          time: dt.time,
+          targetRole: 'ADMIN',
+          timestamp: dt.timestamp,
+        });
+      }
+    }
+
+    // 2. Increase Agent Due & Total Sales
+    agent.totalSales = Number((agent.totalSales + grandTotal).toFixed(2));
+    agent.currentDue = Number((agent.currentDue + grandTotal).toFixed(2));
+
+    // 3. Create Sale Record
+    const newSale: Sale = {
+      id: saleId,
+      invoiceNo: invoiceNumber,
+      agentId: agent.id,
+      agentName: agent.name,
+      customerName: customerName?.trim() || 'Direct Customer',
+      customerPhone: customerPhone?.trim() || '',
+      customerAddress: customerAddress?.trim() || '',
+      saleType,
+      items: frozenItems,
+      subtotal,
+      discount: discountAmount,
+      grandTotal,
+      paymentStatus: 'UNPAID',
+      createdAtDate: dt.date,
+      createdAtTime: dt.time,
+      timestamp: dt.timestamp,
+    };
+
+    db.sales.unshift(newSale);
+
+    // 4. Activity Log
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: agent.name,
+      role: 'AGENT',
+      action: 'Sale Created',
+      referenceId: invoiceNumber,
+      details: `Sold ${frozenItems.length} items to ${newSale.customerName} for ৳${grandTotal.toLocaleString()}. Added to Agent Due.`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+
+    res.json({
+      success: true,
+      sale: newSale,
+      agentUpdatedDue: agent.currentDue,
+      invoiceNo: invoiceNumber,
+    });
+  });
+
+  // Stock: Adjustment / Stock In
+  apiRouter.post('/stock/change', (req, res) => {
+    const { productId, type, quantity, unit, referenceNote, recordedBy } = req.body;
+    const prod = db.products.find((p) => p.id === productId);
+    if (!prod) return res.status(404).json({ error: 'Product not found' });
+
+    const numQty = Number(quantity);
+    if (!numQty || numQty <= 0) {
+      return res.status(400).json({ error: 'Valid positive quantity required' });
+    }
+
+    const stockBefore = unit === 'KG' ? prod.stockKg : prod.stockPcs;
+    if (unit === 'KG') {
+      if (type === 'STOCK_IN' || type === 'RETURN') {
+        prod.stockKg = Number((prod.stockKg + numQty).toFixed(3));
+      } else if (type === 'SALE_OUT' || type === 'ADJUSTMENT') {
+        prod.stockKg = Number((prod.stockKg - numQty).toFixed(3));
+      }
+    } else {
+      if (type === 'STOCK_IN' || type === 'RETURN') {
+        prod.stockPcs += Math.round(numQty);
+      } else if (type === 'SALE_OUT' || type === 'ADJUSTMENT') {
+        prod.stockPcs = Math.max(0, prod.stockPcs - Math.round(numQty));
+      }
+    }
+    const stockAfter = unit === 'KG' ? prod.stockKg : prod.stockPcs;
+
+    const dt = getBangladeshDateTime();
+    const stx: StockTransaction = {
+      id: `STX-${Date.now()}`,
+      productId: prod.id,
+      productName: prod.name,
+      type,
+      quantity: numQty,
+      unit,
+      referenceNote: referenceNote || `${type} recorded manually`,
+      recordedBy: recordedBy || 'Admin Manager',
+      date: dt.date,
+      time: dt.time,
+      createdAtDate: dt.date,
+      createdAtTime: dt.time,
+      timestamp: dt.timestamp,
+      stockBefore,
+      stockAfter,
+    };
+
+    db.stockTransactions.unshift(stx);
+
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: recordedBy || 'Admin Manager',
+      role: 'ADMIN',
+      action: `Stock ${type}`,
+      referenceId: stx.id,
+      details: `${type} of ${numQty} ${unit} for "${prod.name}". New Stock: ${prod.stockKg} KG, ${prod.stockPcs} PCS.`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+    res.json({ success: true, transaction: stx, updatedProduct: prod });
+  });
+
+  // Stock: Delete Transaction
+  apiRouter.delete('/stock/:id', (req, res) => {
+    const { id } = req.params;
+    const index = db.stockTransactions.findIndex((tx) => tx.id === id);
+    if (index === -1) {
+      return res.status(404).json({ error: 'Stock transaction not found' });
+    }
+
+    const [deletedTx] = db.stockTransactions.splice(index, 1);
+
+    const dt = getBangladeshDateTime();
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: 'Admin Manager',
+      role: 'ADMIN',
+      action: 'Stock Record Deleted',
+      referenceId: id,
+      details: `Removed stock record for "${deletedTx.productName}" (${deletedTx.quantity} ${deletedTx.unit})`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+    res.json({ success: true, message: 'Stock transaction removed successfully', deletedId: id });
+  });
+
+  // Due Management: Record Payment / Clear Due
+  apiRouter.post('/payments', (req, res) => {
+    const { agentId, amount, paymentMethod, referenceNote, recordedBy } = req.body;
+    const agent = db.users.find((u) => u.id === agentId && u.role === 'AGENT');
+    if (!agent) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    const numAmount = Number(amount);
+    if (!numAmount || numAmount <= 0) {
+      return res.status(400).json({ error: 'Valid payment amount is required' });
+    }
+
+    const previousDue = agent.currentDue;
+    const remainingDue = Number((previousDue - numAmount).toFixed(2));
+
+    agent.totalPaid = Number((agent.totalPaid + numAmount).toFixed(2));
+    agent.currentDue = remainingDue;
+
+    const dt = getBangladeshDateTime();
+    const paymentRecord: PaymentRecord = {
+      id: `PAY-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(1000 + Math.random() * 9000)}`,
+      agentId: agent.id,
+      agentName: agent.name,
+      amount: numAmount,
+      previousDue,
+      remainingDue,
+      paymentMethod: paymentMethod || 'Cash in Hand',
+      referenceNote: referenceNote || 'Due clearance payment',
+      recordedBy: recordedBy || 'Admin Manager',
+      date: dt.date,
+      time: dt.time,
+      createdAtDate: dt.date,
+      createdAtTime: dt.time,
+      timestamp: dt.timestamp,
+    };
+
+    db.payments.unshift(paymentRecord);
+
+    // Notify Agent
+    const dueNotificationText = remainingDue < 0
+      ? `Admin recorded payment of ৳${numAmount.toLocaleString()}. Your account now has an advance balance of ৳${Math.abs(remainingDue).toLocaleString()} (Due: -৳${Math.abs(remainingDue).toLocaleString()}). Next sales will automatically deduct from this balance.`
+      : `Admin recorded payment of ৳${numAmount.toLocaleString()}. Your remaining due is now ৳${remainingDue.toLocaleString()}.`;
+
+    db.notifications.unshift({
+      id: `NOTIF-${Date.now()}`,
+      title: remainingDue < 0 ? 'Advance Payment Recorded' : 'Payment Received & Due Updated',
+      message: dueNotificationText,
+      type: 'SUCCESS',
+      isRead: false,
+      date: dt.date,
+      time: dt.time,
+      targetRole: 'AGENT',
+      agentId: agent.id,
+      timestamp: dt.timestamp,
+    });
+
+    // Log
+    db.logs.unshift({
+      id: `LOG-${Date.now()}`,
+      user: recordedBy || 'Admin Manager',
+      role: 'ADMIN',
+      action: 'Payment Recorded',
+      referenceId: paymentRecord.id,
+      details: `Received ৳${numAmount.toLocaleString()} from ${agent.name}. Remaining due: ${remainingDue < 0 ? `-৳${Math.abs(remainingDue).toLocaleString()} (Advance)` : `৳${remainingDue.toLocaleString()}`}`,
+      date: dt.date,
+      time: dt.time,
+      timestamp: dt.timestamp,
+    });
+
+    saveDatabase(db);
+    res.json({
+      success: true,
+      payment: paymentRecord,
+      agentRemainingDue: remainingDue,
+    });
+  });
+
+  // Notifications: Mark all read
+  apiRouter.put('/notifications/read-all', (req, res) => {
+    db.notifications.forEach((n) => (n.isRead = true));
+    saveDatabase(db);
+    res.json({ success: true });
+  });
+
+  // Settings: Update
+  apiRouter.post('/settings', (req, res) => {
+    Object.assign(db.settings, req.body);
+    saveDatabase(db);
+    res.json({ success: true, settings: db.settings });
+  });
+
+  // Google Sheets Sync Bridge
+  apiRouter.post('/sync/sheets', async (req, res) => {
+    const { scriptUrl } = req.body;
+    const targetUrl = scriptUrl || db.settings.googleAppsScriptUrl;
+
+    if (!targetUrl) {
+      return res.status(400).json({
+        error: 'Google Apps Script URL is not configured yet. Please paste your deployed Web App URL.',
+      });
+    }
+
+    try {
+      // Forward payload to Google Apps Script Web App
+      const response = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'syncFullState',
+          payload: {
+            salesCount: db.sales.length,
+            paymentsCount: db.payments.length,
+            productsCount: db.products.length,
+            agentsCount: db.users.filter((u) => u.role === 'AGENT').length,
+            timestamp: Date.now(),
+          },
+        }),
+      });
+
+      const data = await response.json();
+      res.json({ success: true, googleResponse: data });
+    } catch (err: any) {
+      res.status(500).json({
+        success: false,
+        error: `Could not connect to Google Apps Script URL: ${err.message}. Please ensure the Web App is deployed with 'Anyone' access.`,
+      });
+    }
+  });
+
+  // Mount API router to handle both /api/* and /* (supporting both standard and Vercel rewritten paths)
+  app.use('/api', apiRouter);
+  app.use('/', apiRouter);
+
+  // Graceful database error handling fallback middleware
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (
+      err.name === 'MongooseError' ||
+      err.name === 'MongoNetworkError' ||
+      err.name === 'MongoServerSelectionError' ||
+      (err.message && (err.message.includes('buffering timed out') || err.message.includes('ECONNREFUSED') || err.message.includes('timed out')))
+    ) {
+      console.warn('[AI Studio] Database offline or unreachable — continuing with local state');
+      if (req.method === 'GET') {
+        return res.json(req.path.endsWith('s') || req.path.endsWith('s/') ? [] : {});
+      }
+      return res.status(503).json({ error: 'Database service temporarily unavailable (running in local mode)' });
+    }
+    next(err);
+  });
+
+  // Global JSON error response handler (never return HTML errors for API calls)
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error('[API Server Error]:', err?.message || err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    const statusCode = typeof err.status === 'number' ? err.status : (typeof err.statusCode === 'number' ? err.statusCode : 500);
+    res.status(statusCode).json({
+      error: err.message || 'Internal server error occurred',
+      success: false,
+    });
+  });
+
+  return app;
+}
+
+export async function startServer() {
+  const app = await createExpressApp();
+
+  // Vite Middleware in dev or static files in production
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`DESHI BITE Server running on http://localhost:${PORT}`);
+  });
+
+  return app;
+}
+
+// Only auto-listen if directly executed as the main server process (not when imported in serverless functions)
+const isServerEntry = Boolean(
+  process.argv[1] &&
+  (process.argv[1].endsWith('server.ts') || process.argv[1].endsWith('server.cjs') || process.argv[1].endsWith('server.js')) &&
+  !process.env.VERCEL &&
+  !process.env.NOW_REGION
+);
+
+if (isServerEntry) {
+  startServer();
+}
