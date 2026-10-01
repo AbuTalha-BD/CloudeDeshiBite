@@ -19,6 +19,37 @@ export const MongoModal: React.FC = () => {
   const [syncDirection, setSyncDirection] = useState<'push' | 'pull'>('push');
   const [copiedSample, setCopiedSample] = useState(false);
 
+  // Helper to parse and sanitize whatever the user typed/pasted
+  const parseUserInput = (raw: string) => {
+    let str = raw.trim();
+    let dbName: string | null = null;
+
+    const dbMatch = str.match(/MONGODB_DB_NAME\s*=\s*['"]?([a-zA-Z0-9_\-]+)['"]?/i);
+    if (dbMatch && dbMatch[1]) {
+      dbName = dbMatch[1].trim();
+    }
+
+    const uriVarMatch = str.match(/MONGODB_URI\s*=\s*['"]?([^\s'"]+)['"]?/i);
+    if (uriVarMatch && uriVarMatch[1]) {
+      str = uriVarMatch[1].trim();
+    }
+
+    const schemeMatch = str.match(/(mongodb(?:\+srv)?:\/\/[^\s'"]+)/i);
+    if (schemeMatch && schemeMatch[1]) {
+      str = schemeMatch[1].trim();
+    }
+
+    str = str.replace(/^["'`]|["'`;,]$/g, '').trim();
+
+    const hasPasswordPlaceholder = str.includes('<password>') || str.includes('<db_password>');
+    const isValidScheme = str.startsWith('mongodb://') || str.startsWith('mongodb+srv://');
+    const wasCleaned = (raw.trim().length > 0) && (str !== raw.trim()) && isValidScheme;
+
+    return { cleanUri: str, dbName, hasPasswordPlaceholder, isValidScheme, wasCleaned };
+  };
+
+  const parsedInfo = parseUserInput(inputUri);
+
   useEffect(() => {
     if (isMongoModalOpen) {
       checkMongoStatus();
@@ -32,8 +63,16 @@ export const MongoModal: React.FC = () => {
       showToast('Please enter your MongoDB connection string (URI)', 'error');
       return;
     }
+
+    if (parsedInfo.hasPasswordPlaceholder) {
+      showToast('Please replace "<password>" with your actual MongoDB user password', 'error');
+      return;
+    }
+
     setIsConnecting(true);
-    const res = await connectMongo(inputUri.trim());
+    // Send either cleaned URI or raw input (server also handles sanitization)
+    const uriToSend = parsedInfo.isValidScheme ? parsedInfo.cleanUri : inputUri.trim();
+    const res = await connectMongo(uriToSend);
     setIsConnecting(false);
     if (res.success) {
       setInputUri('');
@@ -178,6 +217,35 @@ export const MongoModal: React.FC = () => {
                 placeholder="mongodb+srv://<username>:<password>@cluster0.mongodb.net/?retryWrites=true&w=majority"
                 className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none"
               />
+
+              {/* Detected and Auto-cleaned preview */}
+              {parsedInfo.wasCleaned && (
+                <div className="flex items-center justify-between gap-2 p-2 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800">
+                  <div className="flex items-center gap-1.5 truncate">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                    <span className="font-semibold shrink-0">Auto-extracted URI:</span>
+                    <span className="font-mono text-[11px] truncate opacity-90">{parsedInfo.cleanUri}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setInputUri(parsedInfo.cleanUri)}
+                    className="shrink-0 px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[10px] font-bold transition-colors"
+                  >
+                    Clean Input
+                  </button>
+                </div>
+              )}
+
+              {/* Password placeholder warning */}
+              {parsedInfo.hasPasswordPlaceholder && (
+                <div className="flex items-start gap-2 p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900">
+                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div>
+                    <strong>Password placeholder detected:</strong> Please replace <code>&lt;password&gt;</code> in the connection string with your actual MongoDB user password.
+                  </div>
+                </div>
+              )}
+
               <p className="text-[11px] text-slate-500">
                 You can also set the <code>MONGODB_URI</code> environment variable in your AI Studio project settings.
               </p>

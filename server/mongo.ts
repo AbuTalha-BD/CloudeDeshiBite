@@ -51,11 +51,61 @@ export function getWritableDataDir(): string {
 
 const CONFIG_FILE = path.join(getWritableDataDir(), 'mongo_config.json');
 
+// Helper to sanitize and auto-extract MongoDB connection URI from accidental env var syntax or pasted text
+export function sanitizeMongoInput(input: string): { uri: string; dbName?: string; error?: string } {
+  if (!input) return { uri: '' };
+  let str = input.trim();
+
+  let extractedDbName: string | undefined;
+
+  // Extract MONGODB_DB_NAME if present (e.g. MONGODB_DB_NAME=deshi_bite)
+  const dbMatch = str.match(/MONGODB_DB_NAME\s*=\s*['"]?([a-zA-Z0-9_\-]+)['"]?/i);
+  if (dbMatch && dbMatch[1]) {
+    extractedDbName = dbMatch[1].trim();
+  }
+
+  // If there's MONGODB_URI=... in the pasted string
+  const uriVarMatch = str.match(/MONGODB_URI\s*=\s*['"]?([^\s'"]+)['"]?/i);
+  if (uriVarMatch && uriVarMatch[1]) {
+    str = uriVarMatch[1].trim();
+  }
+
+  // If the string contains mongodb:// or mongodb+srv:// anywhere inside it
+  const schemeMatch = str.match(/(mongodb(?:\+srv)?:\/\/[^\s'"]+)/i);
+  if (schemeMatch && schemeMatch[1]) {
+    str = schemeMatch[1].trim();
+  }
+
+  // Clean accidental wrapping quotes or semicolons from copy-paste
+  str = str.replace(/^["'`]|["'`;,]$/g, '').trim();
+
+  if (str.includes('<password>') || str.includes('<db_password>')) {
+    return {
+      uri: str,
+      dbName: extractedDbName,
+      error: 'Please replace "<password>" in your connection string with your actual MongoDB database user password.',
+    };
+  }
+
+  if (str && !str.startsWith('mongodb://') && !str.startsWith('mongodb+srv://')) {
+    return {
+      uri: str,
+      dbName: extractedDbName,
+      error: 'Invalid scheme, expected connection string to start with "mongodb://" or "mongodb+srv://"',
+    };
+  }
+
+  return { uri: str, dbName: extractedDbName };
+}
+
 // Helper to determine the best available MongoDB URI
 function resolveConfiguredUri(): string {
   // 1. Environment variable (Vercel -> Settings -> Environment Variables). Most reliable on serverless.
   const envUri = process.env.MONGODB_URI?.trim();
-  if (envUri && !envUri.startsWith('your_')) return envUri;
+  if (envUri && !envUri.startsWith('your_')) {
+    const { uri } = sanitizeMongoInput(envUri);
+    if (uri) return uri;
+  }
 
   // 2. Saved config from a previous successful connection (only survives on a persistent server)
   try {
@@ -68,7 +118,8 @@ function resolveConfiguredUri(): string {
       if (fs.existsSync(cf)) {
         const parsed = JSON.parse(fs.readFileSync(cf, 'utf-8'));
         if (parsed.uri && typeof parsed.uri === 'string' && parsed.uri.trim() !== '') {
-          return parsed.uri.trim();
+          const { uri } = sanitizeMongoInput(parsed.uri);
+          if (uri) return uri;
         }
       }
     }
@@ -82,7 +133,8 @@ function resolveConfiguredUri(): string {
     if (fs.existsSync(envFile)) {
       const match = fs.readFileSync(envFile, 'utf-8').match(/^MONGODB_URI=(.+)$/m);
       if (match && match[1] && !match[1].startsWith('your_') && match[1].trim() !== '') {
-        return match[1].trim();
+        const { uri } = sanitizeMongoInput(match[1]);
+        if (uri) return uri;
       }
     }
   } catch (e) {
@@ -113,15 +165,24 @@ export function isMongoActive(): boolean {
 }
 
 export async function connectMongo(customUri?: string): Promise<{ success: boolean; message: string }> {
-  let uriToUse = customUri?.trim() || activeUri?.trim() || process.env.MONGODB_URI?.trim() || '';
+  const rawInput = customUri?.trim() || activeUri?.trim() || process.env.MONGODB_URI?.trim() || '';
 
-  // Clean accidental wrapping quotes or spaces from copy-paste
-  uriToUse = uriToUse.replace(/^["']|["']$/g, '').trim();
-
-  if (!uriToUse) {
+  if (!rawInput) {
     isConnected = false;
     lastError = 'No MongoDB URI configured. Running in local persistence mode.';
     return { success: false, message: lastError };
+  }
+
+  const { uri: uriToUse, dbName: extractedDb, error: validationError } = sanitizeMongoInput(rawInput);
+
+  if (validationError) {
+    isConnected = false;
+    lastError = validationError;
+    return { success: false, message: validationError };
+  }
+
+  if (extractedDb) {
+    DB_NAME = extractedDb;
   }
 
   // Reuse existing healthy connection if already connected to this URI
